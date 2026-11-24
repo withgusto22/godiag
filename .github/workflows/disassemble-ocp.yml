@@ -32,7 +32,8 @@ jobs:
           import hashlib
           from sh2dis import segment, sh2
 
-          data = Path("output/ocp.bin").read_bytes()\ndata = data[:len(data) & ~1]
+          data = Path("output/ocp.bin").read_bytes()
+data = data[:len(data) & ~1]
           if len(data) < 3420 or len(data) > 3430:
               raise SystemExit(f"Unexpected payload size: {len(data)}")
           base = 0xFFFF3000
@@ -51,7 +52,9 @@ jobs:
           print("size", len(data))
           print("sha256", hashlib.sha256(data).hexdigest())
           print("disassembled instructions", len(out))
-          print("entry starts", [f"0x{x:08X}" for x in starts])\nprint("payload tail", data[-48:])\nprint("version bytes", data[0xD20:0xD64])
+          print("entry starts", [f"0x{x:08X}" for x in starts])
+print("payload tail", data[-48:])
+print("version bytes", data[0xD20:0xD64])
           print("first instructions:")
           print("\n".join(out[:100]))
           PY
