@@ -1,0 +1,33 @@
+name: Retrieve GODIAG J2534 DLL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/retrieve-godiag-dll.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release DLL
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://github.com/withgusto22/godiag/releases/download/v1/GODIAG_PT32.dll" \
+            --output GODIAG_PT32.dll
+          echo "962412642248af65bf8ae8182c6d9a1c26d7173474fb114807d5c8d2d703e2cf  GODIAG_PT32.dll" | sha256sum --check
+          file GODIAG_PT32.dll
+
+      - name: Upload temporary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GODIAG-PT32-DLL
+          path: GODIAG_PT32.dll
+          if-no-files-found: error
+          retention-days: 1
