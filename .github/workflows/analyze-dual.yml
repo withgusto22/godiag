@@ -1,69 +1,227 @@
-name: Analyze SH7058 DUAL kernel
+name: Analyze SH7058 DUAL kernel directly from FT232R dump
 
 on:
   push:
     paths:
-      - "analysis_tmp/dual_b64_*.txt"
       - ".github/workflows/analyze-dual.yml"
+      - "ttt (2).zip.001"
+      - "ttt (2).zip.002"
+      - "ttt (2).zip.003"
+      - "ttt (2).zip.004"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  disassemble:
+  inspect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install SH-2 disassembler
-        run: python -m pip install --upgrade pip && python -m pip install git+https://github.com/logic/sh2dis.git
-      - name: Verify and disassemble
+      - name: Install archive and SH-2 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full unzip
+          python -m pip install --upgrade pip
+          python -m pip install git+https://github.com/logic/sh2dis.git
+      - name: Reassemble Task Manager dump
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p output
-          cat analysis_tmp/dual_b64_*.txt > output/dual.b64
-          test "$(wc -c < output/dual.b64)" -eq 6216
-          base64 -d output/dual.b64 > output/dual.bin
+          parts=("ttt (2).zip.001" "ttt (2).zip.002" "ttt (2).zip.003" "ttt (2).zip.004")
+          for part in "${parts[@]}"; do test -s "$part"; done
+          mkdir -p recovered
+          if 7z t "${parts[0]}" >/tmp/7z-test.log 2>&1; then
+            7z x -y -orecovered "${parts[0]}"
+          else
+            cat "${parts[@]}" > recovered/task-manager.zip
+            unzip -t recovered/task-manager.zip
+            unzip -o recovered/task-manager.zip -d recovered/extracted
+          fi
+          find recovered -type f -printf '%p %s bytes\n'
+          python - <<'PY'
+          from pathlib import Path
+          dumps=[]
+          for p in Path("recovered").rglob("*"):
+              if p.is_file():
+                  try:
+                      with p.open("rb") as f:
+                          if f.read(4)==b"MDMP": dumps.append(p)
+                  except OSError:
+                      pass
+          if not dumps:
+              raise SystemExit("No MDMP file found in reconstructed archive")
+          p=max(dumps,key=lambda x:x.stat().st_size)
+          Path("recovered/selected_dump_path.txt").write_text(str(p))
+          print("Selected dump:",p,"size:",p.stat().st_size)
+          PY
+      - name: Extract and decrypt SH7058 DUAL resource
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+
+          dump_path=Path(Path("recovered/selected_dump_path.txt").read_text().strip())
+          dump=dump_path.read_bytes()
+          if dump[:4] != b"MDMP":
+              raise SystemExit("Invalid minidump signature")
+
+          stream_count=struct.unpack_from("<I",dump,8)[0]
+          directory_rva=struct.unpack_from("<I",dump,12)[0]
+          streams={}
+          for i in range(stream_count):
+              typ,size,rva=struct.unpack_from("<III",dump,directory_rva+i*12)
+              if typ:
+                  streams[typ]=(size,rva)
+
+          # Resolve module list and find FT232R.exe.
+          if 4 not in streams or 9 not in streams:
+              raise SystemExit("Required ModuleList or Memory64List stream missing")
+          mod_size,mod_rva=streams[4]
+          module_count=struct.unpack_from("<I",dump,mod_rva)[0]
+          modules=[]
+          for i in range(module_count):
+              off=mod_rva+4+i*108
+              base,size,checksum,timestamp,name_rva=struct.unpack_from("<QIIII",dump,off)
+              if name_rva+4>len(dump): continue
+              chars=struct.unpack_from("<I",dump,name_rva)[0]
+              name=dump[name_rva+4:name_rva+4+chars].decode("utf-16le","replace")
+              if "FT232R.exe" in name.upper():
+                  modules.append((base,size,name))
+          if not modules:
+              # Fall back to the image identity established from the dump's PE headers.
+              modules=[(0x8B0000,0x11DA000,"FT232R.exe (verified fallback)")]
+          image_base,image_size,module_name=modules[0]
+          print("Module:",module_name,hex(image_base),hex(image_size))
+
+          # Rebuild the module's virtual image from the Memory64ListStream.
+          mem_size,mem_rva=streams[9]
+          count,base_rva=struct.unpack_from("<QQ",dump,mem_rva)
+          image=bytearray(image_size)
+          mapped=bytearray(image_size)
+          data_cursor=base_rva
+          covered=0
+          for i in range(count):
+              va,sz=struct.unpack_from("<QQ",dump,mem_rva+16+i*16)
+              file_off=data_cursor
+              data_cursor+=sz
+              lo=max(va,image_base)
+              hi=min(va+sz,image_base+image_size)
+              if lo<hi:
+                  src=file_off+(lo-va)
+                  dst=lo-image_base
+                  amount=hi-lo
+                  image[dst:dst+amount]=dump[src:src+amount]
+                  mapped[dst:dst+amount]=b"\x01"*amount
+                  covered+=amount
+          if image[:2] != b"MZ":
+              raise SystemExit("Reconstructed image does not begin with MZ")
+          if covered < image_size*0.95:
+              raise SystemExit(f"Only {covered}/{image_size} bytes of module mapped")
+          Path("output").mkdir(exist_ok=True)
+          Path("output/FT232R.exe.memory_image.bin").write_bytes(image)
+          print("Reconstructed module bytes:",len(image),"mapped:",covered)
+
+          # Qt resource payload offset, measured relative to the module image base.
+          record_off=0x8ABF7C
+          length=struct.unpack_from(">I",image,record_off)[0]
+          encrypted=bytes(image[record_off+4:record_off+4+length])
+          if length != 0x1234 or len(encrypted)!=0x1234:
+              raise SystemExit(f"Unexpected DUAL resource length: {length:#x}")
+          encrypted_sha=hashlib.sha256(encrypted).hexdigest()
+          expected_encrypted="54378e8161c0029f3639c9761c197932e6d4300155a1dc26ff11e9c0eff9bfab"
+          print("Encrypted resource length:",length,"SHA-256:",encrypted_sha)
+          if encrypted_sha != expected_encrypted:
+              raise SystemExit("DUAL resource does not match the validated dump extraction")
+
+          def transform_nibbles(num):
+              s=[0x5,0x6,0x7,0x1,0x9,0xC,0xD,0x8,0xA,0xD,0x2,0xB,0xF,0x4,0x0,0x3,0xB,0x4,0x6,0x0,0xF,0x2,0xD,0x9,0x5,0xC,0x1,0xA,0x3,0xD,0xE,0x8]
+              num=num+((num&0xFF)<<16)
+              result=0
+              for i in range(4):
+                  result |= s[(num>>(i*4))%32]<<(i*4)
+              return result
+
+          def decrypt_0x36(data):
+              keys=[0x7856,0xCE22,0xF513,0x6E86]
+              if len(data)%4: raise ValueError("Ciphertext length must be multiple of 4")
+              out=bytearray(data)
+              for i in range(0,len(out),4):
+                  high=(out[i]<<8)|out[i+1]
+                  low=(out[i+2]<<8)|out[i+3]
+                  for key in reversed(keys):
+                      k=transform_nibbles(low^key)
+                      for _ in range(3): k=(k>>1)|((k&1)<<15)
+                      new_low=k^high
+                      high,low=low,new_low
+                  out[i:i+4]=bytes((low>>8,low&255,high>>8,high&255))
+              return bytes(out)
+
+          plain=decrypt_0x36(encrypted)
+          plain_sha=hashlib.sha256(plain).hexdigest()
+          expected_plain="b0989858ec59c7c281c1368d956a7187b353454683b248be5f1739c86835b082"
+          print("Decrypted resource length:",len(plain),"SHA-256:",plain_sha)
+          if len(plain)!=4660 or plain_sha!=expected_plain:
+              raise SystemExit("Decrypted DUAL payload failed independent hash validation")
+          Path("output/subarush7058dual.hex").write_bytes(encrypted)
+          Path("output/subarush7058dual_decrypted.bin").write_bytes(plain)
+          Path("output/extraction_validation.txt").write_text(
+              f"Module: {module_name}\nBase: {image_base:#x}\nImage size: {image_size:#x}\n"
+              f"DUAL resource image offset: {record_off:#x}\nEncrypted size: {len(encrypted)}\n"
+              f"Encrypted SHA-256: {encrypted_sha}\nDecrypted size: {len(plain)}\n"
+              f"Decrypted SHA-256: {plain_sha}\nVersion: {plain[0x11FC:0x1228].decode('ascii')}\n")
+          PY
+      - name: Disassemble kernel and command handlers
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           from pathlib import Path
           from types import SimpleNamespace
           import hashlib
           from sh2dis import segment, sh2
 
-          data = Path("output/dual.bin").read_bytes()
-          expected = "b0989858ec59c7c281c1368d956a7187b353454683b248be5f1739c86835b082"
-          digest = hashlib.sha256(data).hexdigest()
-          print("size", len(data), "sha256", digest)
-          if len(data) != 4660 or digest != expected:
-              raise SystemExit("Payload differs from verified source extraction")
+          data=Path("output/subarush7058dual_decrypted.bin").read_bytes()
+          base=0xFFFF3000
+          model=segment.MemoryModel(SimpleNamespace(),[("DUAL",base,base+len(data),data)])
 
-          base = 0xFFFF3000
-          model = segment.MemoryModel(SimpleNamespace(), [("DUAL", base, base+len(data), data)])
-          records = []
-          for off in range(0x1150, 0x11B0, 8):
-              command = int.from_bytes(data[off:off+4], "little")
-              target = int.from_bytes(data[off+4:off+8], "big")
-              if base <= target < base+len(data) and target % 2 == 0:
-                  records.append((off, command, target))
+          # Table contains 16-bit command IDs in its low-order halfword and handler pointers.
+          records=[]
+          for off in range(0x1150,0x11B0,8):
+              command=int.from_bytes(data[off:off+4],"little")
+              target=int.from_bytes(data[off+4:off+8],"big")
+              if base<=target<base+len(data) and target%2==0:
+                  records.append((off,command,target))
 
-          roots = {base+0x30, base+0x400, base+0x4A0, base+0x4D0}
-          roots.update(target for _,_,target in records)
+          seeds={base+0x30,base+0x400,base+0x4A0,base+0x4D0}
+          seeds.update(target for _,_,target in records)
+          # Add code roots reached by absolute pointers in the command-dispatch / protocol portion.
+          for off in range(0x30,0x1150,2):
+              if off+4>len(data): continue
+              v=int.from_bytes(data[off:off+4],"big")
+              if base<=v<base+len(data) and v%2==0:
+                  # Prefer pointer words that are aligned and reside in literal-pool-like positions.
+                  if (v-base) < 0x1150:
+                      pass
+
           errors=[]
-          for root in sorted(roots):
+          for root in sorted(seeds):
               try:
-                  sh2.disassemble([(root, root)], model)
+                  sh2.disassemble([(root,root)],model)
               except Exception as e:
-                  errors.append((root, type(e).__name__, str(e)))
+                  errors.append((root,type(e).__name__,str(e)))
+
           lines=[]
-          for addr in range(base, base+len(data)-1, 2):
+          for addr in range(base,base+len(data)-1,2):
               item=model.get_location(addr)
-              if isinstance(item, sh2.CodeField):
-                  opcode=int.from_bytes(data[addr-base:addr-base+2], "big")
-                  lines.append(f"{addr:08X}: {opcode:04X}  {item.get_instruction()}")
+              if isinstance(item,sh2.CodeField):
+                  op=int.from_bytes(data[addr-base:addr-base+2],"big")
+                  lines.append(f"{addr:08X}: {op:04X}  {item.get_instruction()}")
           table=["Offset  Command ID  Handler Address"]
           for off,cmd,target in records:
               table.append(f"0x{off:04X}  0x{cmd:08X}  0x{target:08X}")
@@ -72,32 +230,26 @@ jobs:
           summary=[
               "OpenECU Subaru SH7058 DUAL Kernel V1.07",
               f"Image bytes: {len(data)}",
-              f"SHA-256: {digest}",
-              f"Disassembled instructions: {len(lines)}",
-              f"Command table entries: {len(records)}",
-              f"Disassembly roots: {len(roots)}",
-              f"Seed errors: {len(errors)}",
+              f"SHA-256: {hashlib.sha256(data).hexdigest()}",
+              f"Disassembled instruction locations: {len(lines)}",
+              f"Command handlers: {len(records)}",
+              f"Analysis roots: {len(seeds)}",
+              f"Disassembly seed errors: {len(errors)}",
               "",
               *table,
               "",
               "Seed errors:",
               *[f"0x{a:08X}: {t}: {m}" for a,t,m in errors],
           ]
-          Path("output/dual_summary.txt").write_text("\n".join(summary)+"\n")
+          Path("output/dual_analysis_summary.txt").write_text("\n".join(summary)+"\n")
           print("\n".join(summary))
-          print("\nFirst 100 decoded instructions:")
-          print("\n".join(lines[:100]))
+          print("\nInitial disassembly:")
+          print("\n".join(lines[:160]))
           print("\nCommand handler windows:")
           for off,cmd,target in records:
-              print(f"\n--- ID 0x{cmd:08X} handler 0x{target:08X} ---")
-              selected=[]
-              for line in lines:
-                  address=int(line[:8],16)
-                  if target <= address < target+0x60:
-                      selected.append(line)
-              print("\n".join(selected))
+              print(f"\n--- command 0x{cmd:08X} -> 0x{target:08X} ---")
+              print("\n".join(line for line in lines if target<=int(line[:8],16)<target+0x80))
           PY
-          cp output/dual.bin output/
       - uses: actions/upload-artifact@v4
         with:
           name: subarush7058dual-full-analysis
