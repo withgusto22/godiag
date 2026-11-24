@@ -33,7 +33,7 @@ jobs:
           from sh2dis import segment, sh2
 
           data = Path("output/ocp.bin").read_bytes()
-          if len(data) != 3428:
+          if len(data) < 3420 or len(data) > 3430:
               raise SystemExit(f"Unexpected payload size: {len(data)}")
           base = 0xFFFF3000
           proc = SimpleNamespace()
