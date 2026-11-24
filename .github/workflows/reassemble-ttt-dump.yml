@@ -1,0 +1,51 @@
+name: Reassemble TTT memory dump
+
+on:
+  push:
+    paths:
+      - ".github/workflows/reassemble-ttt-dump.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reassemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full unzip
+
+      - name: Reassemble and validate archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          parts=(ttt_unpacked.zip.001 ttt_unpacked.zip.002 ttt_unpacked.zip.003 ttt_unpacked.zip.004)
+          for part in "${parts[@]}"; do
+            test -s "$part"
+          done
+
+          mkdir -p recovered
+          if 7z t ttt_unpacked.zip.001 >/tmp/7z-test.log 2>&1; then
+            7z x -y -orecovered ttt_unpacked.zip.001
+          else
+            cat "${parts[@]}" > recovered/ttt_unpacked.zip
+            unzip -t recovered/ttt_unpacked.zip
+            unzip -o recovered/ttt_unpacked.zip -d recovered/extracted
+          fi
+
+          find recovered -type f -printf '%p %s bytes\n'
+          find recovered -type f -name '*.dmp' -print -quit | grep -q .
+
+      - name: Upload reconstructed dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttt-unpacked-memory-dump
+          path: recovered/
+          if-no-files-found: error
+          retention-days: 2
