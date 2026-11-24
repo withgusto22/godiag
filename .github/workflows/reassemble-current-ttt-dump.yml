@@ -1,0 +1,65 @@
+name: Reassemble current Task Manager dump
+
+on:
+  push:
+    paths:
+      - ".github/workflows/reassemble-current-ttt-dump.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reassemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full unzip
+
+      - name: Reassemble and inspect archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          parts=("ttt (2).zip.001" "ttt (2).zip.002" "ttt (2).zip.003" "ttt (2).zip.004")
+          for part in "${parts[@]}"; do
+            test -s "$part"
+            printf '%s  ' "$part"
+            sha256sum "$part"
+          done
+
+          mkdir -p recovered
+          cat "${parts[@]}" > recovered/ttt-taskmanager-current.zip
+          file recovered/ttt-taskmanager-current.zip
+          if 7z t recovered/ttt-taskmanager-current.zip; then
+            7z x -y -orecovered/extracted recovered/ttt-taskmanager-current.zip
+          else
+            unzip -t recovered/ttt-taskmanager-current.zip
+            unzip -o recovered/ttt-taskmanager-current.zip -d recovered/extracted
+          fi
+
+          find recovered/extracted -type f -printf '%p %s bytes\n'
+          python3 - <<'PY'
+          from pathlib import Path
+          files = [p for p in Path("recovered/extracted").rglob("*") if p.is_file()]
+          hits = []
+          for p in files:
+              with p.open("rb") as f:
+                  if f.read(4) == b"MDMP":
+                      hits.append(p)
+          if not hits:
+              raise SystemExit("No Windows minidump (MDMP) signature found in extracted files")
+          print("Verified minidump(s):", *(str(p) for p in hits), sep="\n")
+          PY
+
+      - name: Upload recovered dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-ttt-taskmanager-dump
+          path: recovered/extracted/
+          if-no-files-found: error
+          retention-days: 2
