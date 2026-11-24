@@ -29,82 +29,78 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           from types import SimpleNamespace
-          import hashlib, re
+          import hashlib
           from sh2dis import segment, sh2
 
           data = Path("output/dual.bin").read_bytes()
           expected = "b0989858ec59c7c281c1368d956a7187b353454683b248be5f1739c86835b082"
           digest = hashlib.sha256(data).hexdigest()
-          print("decoded_size", len(data))
-          print("decoded_sha256", digest)
+          print("size", len(data), "sha256", digest)
           if len(data) != 4660 or digest != expected:
-              raise SystemExit("Staged image does not match the verified extracted kernel")
+              raise SystemExit("Payload differs from verified source extraction")
+
           base = 0xFFFF3000
-          model = segment.MemoryModel(SimpleNamespace(), [("DUAL", base, base + len(data), data)])
+          model = segment.MemoryModel(SimpleNamespace(), [("DUAL", base, base+len(data), data)])
 
-          # Documented command-dispatch table found at 0x1168.
-          dispatch = []
+          # The command table is mixed-format: little-endian command IDs,
+          # followed by big-endian SH7058 handler addresses.
+          records = []
           for off in range(0x1150, 0x11B0, 8):
-              if off + 8 > len(data):
+              if off+8 > len(data):
                   break
-              cmd = int.from_bytes(data[off:off+4], "big")
+              command = int.from_bytes(data[off:off+4], "little")
               target = int.from_bytes(data[off+4:off+8], "big")
-              if base <= target < base + len(data) and target % 2 == 0:
-                  dispatch.append((cmd, target, off))
+              if base <= target < base+len(data) and target % 2 == 0:
+                  records.append((off, command, target))
 
-          # Include kernel start and SCI routine plus all registered command handlers.
-          seeds = {base + x for x in (0x30, 0x400, 0x4A0, 0x4D0, 0x780, 0x840, 0xAC0, 0xD00, 0xE00, 0xF00)}
-          for cmd, target, off in dispatch:
-              seeds.add(target)
-          # Scan aligned 32-bit values for additional absolute in-image pointers.
-          pointers = []
-          for off in range(0, len(data)-3, 2):
-              v = int.from_bytes(data[off:off+4], "big")
-              if base <= v < base + len(data) and v % 2 == 0:
-                  pointers.append((off, v))
-                  seeds.add(v)
-          failures = []
-          for start in sorted(seeds):
+          roots = {base+0x30, base+0x400, base+0x4A0, base+0x4D0}
+          roots.update(target for _,_,target in records)
+          errors=[]
+          for root in sorted(roots):
               try:
-                  sh2.disassemble([(start, start)], model)
+                  sh2.disassemble([(root, root)], model)
               except Exception as e:
-                  failures.append((start, type(e).__name__, str(e)))
+                  errors.append((root, type(e).__name__, str(e)))
+
           lines=[]
           for addr in range(base, base+len(data)-1, 2):
               item=model.get_location(addr)
               if isinstance(item, sh2.CodeField):
-                  op=int.from_bytes(data[addr-base:addr-base+2], "big")
-                  lines.append(f"{addr:08X}: {op:04X}  {item.get_instruction()}")
-          Path("output/dual_disassembly.txt").write_text("\n".join(lines)+"\n")
-          table = ["Command / handler table (file offset 0x1150 onward):",
-                   "offset  command-id  handler"]
-          for cmd, target, off in dispatch:
+                  opcode=int.from_bytes(data[addr-base:addr-base+2], "big")
+                  lines.append(f"{addr:08X}: {opcode:04X}  {item.get_instruction()}")
+
+          table=["Offset  Command ID  Handler Address"]
+          for off,cmd,target in records:
               table.append(f"0x{off:04X}  0x{cmd:08X}  0x{target:08X}")
-          Path("output/dual_dispatch_table.txt").write_text("\n".join(table)+"\n")
-          summary = [
-              "OpenECU SH7058 DUAL Kernel V1.07",
-              f"Size: {len(data)} bytes",
+          Path("output/dual_disassembly.txt").write_text("\n".join(lines)+"\n")
+          Path("output/dual_command_table.txt").write_text("\n".join(table)+"\n")
+          summary=[
+              "OpenECU Subaru SH7058 DUAL Kernel V1.07",
+              f"Image bytes: {len(data)}",
               f"SHA-256: {digest}",
-              f"Disassembled instruction locations: {len(lines)}",
-              f"Candidate in-image pointer words: {len(pointers)}",
-              f"Disassembly roots: {len(seeds)}",
-              f"Seed failures: {len(failures)}",
+              f"Disassembled instructions: {len(lines)}",
+              f"Command table entries: {len(records)}",
+              f"Disassembly roots: {len(roots)}",
+              f"Seed errors: {len(errors)}",
               "",
-              "Dispatch table:",
               *table,
               "",
-              "Seed failures (first 50):",
-              *[f"0x{a:08X}: {t}: {m}" for a,t,m in failures[:50]],
+              "Seed errors:",
+              *[f"0x{a:08X}: {t}: {m}" for a,t,m in errors],
           ]
-          Path("output/analysis_summary.txt").write_text("\n".join(summary)+"\n")
+          Path("output/dual_summary.txt").write_text("\n".join(summary)+"\n")
           print("\n".join(summary))
-          print("First 120 disassembled instructions:")
-          print("\n".join(lines[:120]))
-          print("Instruction lines around handler targets:")
-          for cmd,target,off in dispatch:
-              rel=target-base
-              print(f"\n--- command 0x{cmd:08X} -> 0x{target:08X} ---")
-              print("\n".join(x for x in lines if int(x[:8],16) >= target and int(x[:8],16) < target+0x70)[:4000])
+          print("\nFirst 100 decoded instructions:")
+          print("\n".join(lines[:100]))
+          print("\nCommand handler windows:")
+          for off,cmd,target in records:
+              print(f"\n--- ID 0x{cmd:08X} handler 0x{target:08X} ---")
+              selected=[]
+              for line in lines:
+                  address=int(line[:8],16)
+                  if target <= address < target+0x60:
+                      selected.append(line)
+              print("\n".join(selected))
           PY
           cp analysis_tmp/subarush7058dual_decrypted.b64 output/
       - uses: actions/upload-artifact@v4
