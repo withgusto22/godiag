@@ -1,0 +1,63 @@
+name: Disassemble decrypted SH7058 OCP kernel
+
+on:
+  push:
+    paths:
+      - "analysis_tmp/ocp_kernel_decrypted.b64"
+      - ".github/workflows/disassemble-ocp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disassemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install SH-2 disassembler
+        run: python -m pip install --upgrade pip && python -m pip install git+https://github.com/logic/sh2dis.git
+      - name: Decode and disassemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          base64 -d analysis_tmp/ocp_kernel_decrypted.b64 > output/ocp.bin
+          python - <<'PY'
+          from pathlib import Path
+          from types import SimpleNamespace
+          import hashlib
+          from sh2dis import segment, sh2
+
+          data = Path("output/ocp.bin").read_bytes()
+          if len(data) != 3428:
+              raise SystemExit(f"Unexpected payload size: {len(data)}")
+          base = 0xFFFF3000
+          proc = SimpleNamespace()
+          model = segment.MemoryModel(proc, [("OCP", base, base + len(data), data)])
+          starts = [base + 0x30, base + 0x400, base + 0x4A0]
+          for start in starts:
+              sh2.disassemble([(start, None)], model)
+
+          out = []
+          for addr in range(base, base + len(data) - 1, 2):
+              item = model.get_location(addr)
+              if isinstance(item, sh2.CodeField):
+                  out.append(f"{addr:08X}: {int.from_bytes(data[addr-base:addr-base+2], 'big'):04X}  {item.get_instruction()}")
+          Path("output/ocp_disassembly.txt").write_text("\n".join(out) + "\n")
+          print("size", len(data))
+          print("sha256", hashlib.sha256(data).hexdigest())
+          print("disassembled instructions", len(out))
+          print("entry starts", [f"0x{x:08X}" for x in starts])
+          print("first instructions:")
+          print("\n".join(out[:100]))
+          PY
+          cp analysis_tmp/ocp_kernel_decrypted.b64 output/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sh7058-ocp-disassembly
+          path: output/
+          retention-days: 2
