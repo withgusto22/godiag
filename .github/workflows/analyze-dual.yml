@@ -3,7 +3,7 @@ name: Analyze SH7058 DUAL kernel
 on:
   push:
     paths:
-      - "analysis_tmp/subarush7058dual_decrypted.b64"
+      - "analysis_tmp/dual_b64_*.txt"
       - ".github/workflows/analyze-dual.yml"
   workflow_dispatch:
 
@@ -25,7 +25,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p output
-          base64 -d analysis_tmp/subarush7058dual_decrypted.b64 > output/dual.bin
+          cat analysis_tmp/dual_b64_*.txt > output/dual.b64
+          test "$(wc -c < output/dual.b64)" -eq 6216
+          base64 -d output/dual.b64 > output/dual.bin
           python - <<'PY'
           from pathlib import Path
           from types import SimpleNamespace
@@ -41,13 +43,8 @@ jobs:
 
           base = 0xFFFF3000
           model = segment.MemoryModel(SimpleNamespace(), [("DUAL", base, base+len(data), data)])
-
-          # The command table is mixed-format: little-endian command IDs,
-          # followed by big-endian SH7058 handler addresses.
           records = []
           for off in range(0x1150, 0x11B0, 8):
-              if off+8 > len(data):
-                  break
               command = int.from_bytes(data[off:off+4], "little")
               target = int.from_bytes(data[off+4:off+8], "big")
               if base <= target < base+len(data) and target % 2 == 0:
@@ -61,14 +58,12 @@ jobs:
                   sh2.disassemble([(root, root)], model)
               except Exception as e:
                   errors.append((root, type(e).__name__, str(e)))
-
           lines=[]
           for addr in range(base, base+len(data)-1, 2):
               item=model.get_location(addr)
               if isinstance(item, sh2.CodeField):
                   opcode=int.from_bytes(data[addr-base:addr-base+2], "big")
                   lines.append(f"{addr:08X}: {opcode:04X}  {item.get_instruction()}")
-
           table=["Offset  Command ID  Handler Address"]
           for off,cmd,target in records:
               table.append(f"0x{off:04X}  0x{cmd:08X}  0x{target:08X}")
@@ -102,7 +97,7 @@ jobs:
                       selected.append(line)
               print("\n".join(selected))
           PY
-          cp analysis_tmp/subarush7058dual_decrypted.b64 output/
+          cp output/dual.bin output/
       - uses: actions/upload-artifact@v4
         with:
           name: subarush7058dual-full-analysis
