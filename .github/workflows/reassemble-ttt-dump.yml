@@ -1,4 +1,4 @@
-name: Reassemble TTT memory dump
+name: Reassemble Task Manager TTT dump
 
 on:
   push:
@@ -21,31 +21,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y p7zip-full unzip
 
-      - name: Reassemble and validate archive
+      - name: Reassemble and validate Task Manager dump
         shell: bash
         run: |
           set -euo pipefail
-          parts=(ttt_unpacked.zip.001 ttt_unpacked.zip.002 ttt_unpacked.zip.003 ttt_unpacked.zip.004)
+          parts=("ttt (2).zip.001" "ttt (2).zip.002" "ttt (2).zip.003" "ttt (2).zip.004")
           for part in "${parts[@]}"; do
             test -s "$part"
           done
 
           mkdir -p recovered
-          if 7z t ttt_unpacked.zip.001 >/tmp/7z-test.log 2>&1; then
-            7z x -y -orecovered ttt_unpacked.zip.001
+          if 7z t "${parts[0]}" >/tmp/7z-test.log 2>&1; then
+            7z x -y -orecovered "${parts[0]}"
           else
-            cat "${parts[@]}" > recovered/ttt_unpacked.zip
-            unzip -t recovered/ttt_unpacked.zip
-            unzip -o recovered/ttt_unpacked.zip -d recovered/extracted
+            cat "${parts[@]}" > recovered/task-manager-dump.zip
+            unzip -t recovered/task-manager-dump.zip
+            unzip -o recovered/task-manager-dump.zip -d recovered/extracted
           fi
 
           find recovered -type f -printf '%p %s bytes\n'
-          find recovered -type f -name '*.dmp' -print -quit | grep -q .
+          find recovered -type f \( -iname '*.dmp' -o -iname '*.mdmp' \) -print -quit | grep -q .
 
-      - name: Upload reconstructed dump
+      - name: Upload recovered Task Manager dump
         uses: actions/upload-artifact@v4
         with:
-          name: ttt-unpacked-memory-dump
+          name: task-manager-ttt-dump
           path: recovered/
           if-no-files-found: error
           retention-days: 2
