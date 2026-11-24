@@ -33,12 +33,11 @@ jobs:
           from sh2dis import segment, sh2
 
           data = Path("output/ocp.bin").read_bytes()
-data = data[:len(data) & ~1]
+          data = data[:len(data) & ~1]
           if len(data) < 3420 or len(data) > 3430:
               raise SystemExit(f"Unexpected payload size: {len(data)}")
           base = 0xFFFF3000
-          proc = SimpleNamespace()
-          model = segment.MemoryModel(proc, [("OCP", base, base + len(data), data)])
+          model = segment.MemoryModel(SimpleNamespace(), [("OCP", base, base + len(data), data)])
           starts = [base + 0x30, base + 0x400, base + 0x4A0]
           for start in starts:
               sh2.disassemble([(start, start)], model)
@@ -47,14 +46,15 @@ data = data[:len(data) & ~1]
           for addr in range(base, base + len(data) - 1, 2):
               item = model.get_location(addr)
               if isinstance(item, sh2.CodeField):
-                  out.append(f"{addr:08X}: {int.from_bytes(data[addr-base:addr-base+2], 'big'):04X}  {item.get_instruction()}")
+                  op = int.from_bytes(data[addr-base:addr-base+2], "big")
+                  out.append(f"{addr:08X}: {op:04X}  {item.get_instruction()}")
           Path("output/ocp_disassembly.txt").write_text("\n".join(out) + "\n")
           print("size", len(data))
           print("sha256", hashlib.sha256(data).hexdigest())
           print("disassembled instructions", len(out))
           print("entry starts", [f"0x{x:08X}" for x in starts])
-print("payload tail", data[-48:])
-print("version bytes", data[0xD20:0xD64])
+          print("payload tail", data[-48:])
+          print("version bytes", data[0xD20:0xD64])
           print("first instructions:")
           print("\n".join(out[:100]))
           PY
